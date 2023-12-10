@@ -5,24 +5,24 @@ using Microsoft.Extensions.Hosting;
 using WorkerServiceHealthChecker.Exceptions;
 
 namespace WorkerServiceHealthChecker;
-public class HealthCheckServer : BackgroundService
+public class HttpHealthCheckServer : BackgroundService
 {
     private readonly HttpListener _httpListener = new();
-    private readonly HealthCheckService _healthCheckService;
     private readonly bool _silentMode;
-    
+    private readonly IHealthCheckerService _healthCheckerService;
+
     public Func<HttpListenerRequest, bool>? RequestPredicate { get; set; }
 
-    public HealthCheckServer(HealthCheckService healthCheckService, HealthCheckParameters healthCheckParameters)
+    public HttpHealthCheckServer(IHealthCheckerService healthCheckerService, HealthCheckParameters healthCheckParameters)
     {
-        _healthCheckService = healthCheckService;
+        _healthCheckerService = healthCheckerService;
         var s = healthCheckParameters.UseHttps ? "s" : "";
         _httpListener.Prefixes.Add($"http{s}://+:{healthCheckParameters.Port}/{healthCheckParameters.Endpoint}/");
 
-        _silentMode = healthCheckParameters.Silent;
+        _silentMode = healthCheckParameters.SilentMode;
     }
     
-    protected override Task ExecuteAsync(CancellationToken ctx)
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
         {
@@ -30,11 +30,14 @@ public class HealthCheckServer : BackgroundService
         }
         catch (HttpListenerException ex)
         {
+            var errorMessage = "You may need to grant permissions to your user account if not running as Administrator:" +
+                                        $" \"netsh http add urlacl url={ _httpListener.Prefixes.First()} user=DOMAIN\\\\user\"";
+            
+            Trace.WriteLine($"Error starting {nameof(HttpHealthCheckServer)}. " + errorMessage);
+            
             if (!_silentMode)
             {
-                throw new ListenerException(
-                    "You may need to grant permissions to your user account if not running as Administrator:" +
-                    " \"netsh http add urlacl url=http://+:1234/metrics user=DOMAIN\\\\user\"", ex);
+                throw new ListenerException(errorMessage, ex);
             }
             
             return Task.CompletedTask;
@@ -44,21 +47,21 @@ public class HealthCheckServer : BackgroundService
         {
             try
             {
-                while (!ctx.IsCancellationRequested)
+                while (!stoppingToken.IsCancellationRequested)
                 {
                     var getContext = _httpListener.GetContextAsync();
-                    getContext.Wait(ctx);
+                    getContext.Wait(stoppingToken);
                     var context = getContext.Result;
                     
                     _ = Task.Factory.StartNew(async delegate
                     {
-                        await HandleRequestAsync(context, ctx);
-                    }, ctx);
+                        await HandleRequest(context, stoppingToken);
+                    }, stoppingToken);
                 }
             }
             catch (Exception ex)
             {
-                Trace.WriteLine($"Error in {nameof(HealthCheckServer)}: {ex}");
+                Trace.WriteLine($"Error in {nameof(HttpHealthCheckServer)}: {ex}");
             }
             finally
             {
@@ -68,7 +71,7 @@ public class HealthCheckServer : BackgroundService
         }, TaskCreationOptions.LongRunning);
     }
     
-    private async Task HandleRequestAsync(HttpListenerContext context, CancellationToken ctx)
+    private async Task HandleRequest(HttpListenerContext context, CancellationToken ctx)
     {
         var request = context.Request;
         var response = context.Response;
@@ -100,10 +103,10 @@ public class HealthCheckServer : BackgroundService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            if (!_httpListener!.IsListening)
+            if (!_httpListener.IsListening)
                 return;
 
-            Trace.WriteLine($"Error in {nameof(HealthCheckServer)}: {ex}");
+            Trace.WriteLine($"Error in {nameof(HttpHealthCheckServer)}: {ex}");
 
             try
             {
@@ -119,21 +122,21 @@ public class HealthCheckServer : BackgroundService
             response.Close();
         }
     }
-
+    
     private async Task HandleHealthCheckRequest(HttpListenerResponse response, CancellationToken ctx)
     {
-        var healthReport = await _healthCheckService.CheckHealthAsync(ctx);
+        var healthCheckReport = await _healthCheckerService.GetHealthReportAsync(ctx);
 
-        var healthCheckStatus = healthReport.Status == HealthStatus.Healthy
+        var healthCheckStatus = healthCheckReport.Status == HealthStatus.Healthy
             ? "All services are healthy."
             : "Unhealthy: " + string.Join(", ",
-                healthReport.Entries.Select(x => x.Key + ": " + x.Value.Status));
-
+                healthCheckReport.Entries.Select(x => x.Key + ": " + x.Value.Status));
+        
         await using (var writer = new StreamWriter(response.OutputStream))
             await writer.WriteAsync(healthCheckStatus);
         await response.OutputStream.DisposeAsync();
     }
-    
+
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         if (_httpListener.IsListening) _httpListener.Stop();
